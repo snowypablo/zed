@@ -2,7 +2,8 @@ use agent_ui::AgentPanel;
 use anyhow::{Context as _, Result, ensure};
 use collections::HashMap;
 use editor::{Editor, actions::RunDiffReview};
-use gpui::{Context, PromptLevel, TaskExt as _, Window};
+use git_ui::ReviewAgent;
+use gpui::{Context, TaskExt as _, Window};
 use serde::Deserialize;
 use workspace::{Toast, Workspace, notifications::NotificationId};
 
@@ -23,56 +24,53 @@ pub(super) fn run_diff_review(
         workspace.show_error("There are no review drafts ready to run.", cx);
         return;
     }
-    let count = feedback.len();
-    let noun = if count == 1 { "comment" } else { "comments" };
-    let answer = window.prompt(
-        PromptLevel::Info,
-        "Run review with an agent",
-        Some(&format!(
-            "Start a new session to address {count} review {noun}."
-        )),
-        &["Claude", "Codex", "Cancel"],
+    let Some(agent) = ReviewAgent::selected(cx) else {
+        workspace.show_error("Choose a review agent in the diff toolbar first.", cx);
+        return;
+    };
+    let agent_name = agent.label();
+    let comment_ids: Vec<_> = feedback.iter().map(|(id, _)| *id).collect();
+    let start = (|| -> Result<_> {
+        let worktree = editor
+            .read(cx)
+            .review_worktree(&comment_ids, cx)
+            .context("The review comments must belong to one worktree.")?;
+        let feedback = feedback
+            .into_iter()
+            .map(|(id, item)| serde_json::json!({"id": id, "feedback": item}))
+            .collect::<Vec<_>>();
+        let feedback = serde_json::to_string_pretty(&feedback)?;
+        let prompt = format!(
+            "Address this human-authored review feedback in the current worktree. Read the code and use the file, line range, and excerpt to locate each item. Make the requested fixes where appropriate. Answer questions without editing code when the reviewer only asks for an explanation. Keep replies concise. Preserve existing unrelated changes and leave the edits uncommitted. End your final assistant message with a fenced json code block containing an object with a replies array. Each reply must have the original integer id and a body explaining what changed or what remains. Include at most one reply per id. Omit items that need no reply.\n\n{feedback}"
+        );
+        let panel = workspace
+            .panel::<AgentPanel>(cx)
+            .context("The Agent Panel is unavailable.")?;
+        panel.update(cx, |panel, cx| {
+            panel.run_diff_review(agent.id().into(), &worktree, prompt, window, cx)
+        })
+    })();
+    let run = match start {
+        Ok(run) => run,
+        Err(error) => {
+            workspace.show_error(error.to_string(), cx);
+            return;
+        }
+    };
+
+    editor.update(cx, |editor, cx| editor.begin_diff_review(&comment_ids, cx));
+    workspace.show_toast(
+        Toast::new(
+            NotificationId::unique::<RunDiffReview>(),
+            format!("{agent_name} is addressing your review"),
+        ),
         cx,
     );
 
     let editor = editor.downgrade();
     cx.spawn_in(window, async move |workspace, cx| {
-        let (agent_name, agent_id) = match answer.await {
-            Ok(0) => ("Claude", "claude-acp"),
-            Ok(1) => ("Codex", "codex-acp"),
-            _ => return Ok(()),
-        };
-
-        let comment_ids: Vec<_> = feedback.iter().map(|(id, _)| *id).collect();
-        let start = workspace.update_in(cx, |workspace, window, cx| -> Result<_> {
-            let editor = editor.upgrade().context("The reviewed diff was closed.")?;
-            ensure!(editor.read(cx).review_feedback(cx) == feedback, "The review drafts changed. Run the review again.");
-            let worktree = editor.read(cx).review_worktree(&comment_ids, cx)
-                .context("The review comments must belong to one worktree.")?;
-            let feedback = feedback.into_iter().map(|(id, item)| {
-                serde_json::json!({"id": id, "feedback": item})
-            }).collect::<Vec<_>>();
-            let feedback = serde_json::to_string_pretty(&feedback)?;
-            let prompt = format!(
-                "Address this human-authored review feedback in the current worktree. Read the code and use the file, line range, and excerpt to locate each item. Make the requested fixes where appropriate. Answer questions without editing code when the reviewer only asks for an explanation. Keep replies concise. Preserve existing unrelated changes and leave the edits uncommitted. End your final assistant message with a fenced json code block containing an object with a replies array. Each reply must have the original integer id and a body explaining what changed or what remains. Include at most one reply per id. Omit items that need no reply.\n\n{feedback}"
-            );
-            let panel = workspace.panel::<AgentPanel>(cx).context("The Agent Panel is unavailable.")?;
-            let run = panel.update(cx, |panel, cx| panel.run_diff_review(agent_id.into(), &worktree, prompt, window, cx))?;
-
-            editor.update(cx, |editor, cx| editor.begin_diff_review(&comment_ids, cx));
-            workspace.show_toast(Toast::new(NotificationId::unique::<RunDiffReview>(), format!("{agent_name} is addressing your review")), cx);
-            Ok(run)
-        })?;
-
-        let run = match start {
-            Ok(run) => run,
-            Err(error) => {
-                workspace.update(cx, |workspace, cx| workspace.show_error(error.to_string(), cx))?;
-                return Ok(());
-            }
-        };
-
-        let result = run.await
+        let result = run
+            .await
             .context("The review session ended before returning replies.")
             .and_then(|result| result)
             .and_then(|response| parse_replies(&response, &comment_ids));
@@ -80,19 +78,32 @@ pub(super) fn run_diff_review(
         workspace.update_in(cx, |workspace, window, cx| {
             if let Some(editor) = editor.upgrade() {
                 editor.update(cx, |editor, cx| {
-                    editor.finish_diff_review(&comment_ids, agent_name.into(), result.as_ref().ok(), window, cx);
+                    editor.finish_diff_review(
+                        &comment_ids,
+                        agent_name.into(),
+                        result.as_ref().ok(),
+                        window,
+                        cx,
+                    );
                 });
             }
             match result {
                 Ok(replies) => {
                     let count = replies.len();
                     let noun = if count == 1 { "reply" } else { "replies" };
-                    workspace.show_toast(Toast::new(NotificationId::unique::<RunDiffReview>(), format!("{agent_name} finished the review · {count} {noun}")), cx);
+                    workspace.show_toast(
+                        Toast::new(
+                            NotificationId::unique::<RunDiffReview>(),
+                            format!("{agent_name} finished the review · {count} {noun}"),
+                        ),
+                        cx,
+                    );
                 }
                 Err(error) => workspace.show_error(error.to_string(), cx),
             }
         })
-    }).detach_and_log_err(cx);
+    })
+    .detach_and_log_err(cx);
 }
 
 #[derive(Deserialize)]

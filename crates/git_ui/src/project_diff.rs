@@ -1,6 +1,7 @@
 use crate::{
     branch_diff::BranchDiff,
     diff_multibuffer::DiffMultibuffer,
+    diff_review::render_run_review_controls,
     git_panel::{GitPanel, GitPanelAddon, GitStatusEntry},
     staged_diff::StagedDiff,
     unstaged_diff::UnstagedDiff,
@@ -962,26 +963,17 @@ impl Render for ProjectDiffToolbar {
             )
             .when(review_count > 0, |el| {
                 el.child(Divider::vertical()).child(
-                    render_run_review_button(review_count, &focus_handle).on_click(cx.listener(
-                        |this, _, window, cx| this.dispatch_action(&RunDiffReview, window, cx),
-                    )),
+                    render_run_review_controls(
+                        review_count,
+                        &focus_handle,
+                        cx.listener(|this, _, window, cx| {
+                            this.dispatch_action(&RunDiffReview, window, cx)
+                        }),
+                        cx,
+                    ),
                 )
             })
     }
-}
-
-pub(crate) fn render_run_review_button(review_count: usize, focus_handle: &FocusHandle) -> Button {
-    Button::new("send-review", format!("Run Review ({review_count})"))
-        .start_icon(
-            Icon::new(IconName::ZedAssistant)
-                .size(IconSize::Small)
-                .color(Color::Muted),
-        )
-        .tooltip(Tooltip::for_action_title_in(
-            "Start an agent to address draft review comments",
-            &RunDiffReview,
-            focus_handle,
-        ))
 }
 
 #[cfg(test)]

@@ -1,7 +1,7 @@
 use crate::{
     diff_multibuffer::DiffMultibuffer,
     git_panel::{GitPanel, GitPanelAddon, GitStatusEntry},
-    project_diff::render_run_review_button,
+    diff_review::render_run_review_controls,
 };
 use anyhow::{Context as _, Result};
 use buffer_diff::DiffHunkStatus;
@@ -605,9 +605,14 @@ impl Render for StagedDiffToolbar {
             })
             .when(review_count > 0, |this| {
                 this.child(
-                    render_run_review_button(review_count, &focus_handle).on_click(cx.listener(
-                        |this, _, window, cx| this.dispatch_action(&RunDiffReview, window, cx),
-                    )),
+                    render_run_review_controls(
+                        review_count,
+                        &focus_handle,
+                        cx.listener(|this, _, window, cx| {
+                            this.dispatch_action(&RunDiffReview, window, cx)
+                        }),
+                        cx,
+                    ),
                 )
                 .child(Divider::vertical())
             })

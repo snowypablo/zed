@@ -1,9 +1,9 @@
 use crate::{
     branch_picker,
     diff_multibuffer::DiffMultibuffer,
+    diff_review::render_run_review_controls,
     project_diff::{
         self, CompareWithBranch, DeployBranchDiff, ProjectDiff, ReviewDiff,
-        render_run_review_button,
     },
 };
 use agent_settings::AgentSettings;
@@ -896,9 +896,14 @@ impl Render for BranchDiffToolbar {
             })
             .when(review_count > 0, |this| {
                 this.child(Divider::vertical()).child(
-                    render_run_review_button(review_count, &focus_handle).on_click(cx.listener(
-                        |this, _, window, cx| this.dispatch_action(&RunDiffReview, window, cx),
-                    )),
+                    render_run_review_controls(
+                        review_count,
+                        &focus_handle,
+                        cx.listener(|this, _, window, cx| {
+                            this.dispatch_action(&RunDiffReview, window, cx)
+                        }),
+                        cx,
+                    ),
                 )
             })
     }
