@@ -47155,30 +47155,124 @@ fn test_review_feedback_attaches_the_reply_to_the_original_comment(cx: &mut Test
             editor.add_review_comment(key.clone(), "A separate draft".into(), start..end, cx);
         editor.begin_diff_review(&[comment_id], cx);
         assert_eq!(editor.review_feedback(cx)[0].0, other_comment);
+        let thread_id = uuid::Uuid::new_v4();
         editor.finish_diff_review(
             &[comment_id],
+            thread_id,
             "Codex".into(),
             Some(&HashMap::from_iter([(
                 comment_id,
                 "Handled the edge case.".into(),
             )])),
-            window,
             cx,
         );
 
         let comments = editor.comments_for_hunk(&key, &snapshot);
         assert_eq!(comments[0].status, ReviewCommentStatus::Sent);
+        let conversation = comments[0].conversation.as_ref().unwrap();
+        assert_eq!(conversation.thread_id, thread_id);
+        assert_eq!(conversation.agent.as_ref(), "Codex");
         assert_eq!(
-            comments[0]
-                .agent_reply
-                .as_ref()
-                .map(|(agent, reply)| (agent.as_ref(), reply.as_str())),
-            Some(("Codex", "Handled the edge case."))
+            conversation.messages,
+            [super::git::ReviewMessage::Agent(
+                "Handled the edge case.".into()
+            )]
         );
         assert_eq!(comments[1].status, ReviewCommentStatus::Draft);
-        assert!(comments[1].agent_reply.is_none());
+        assert!(comments[1].conversation.is_none());
     });
     assert!(result.is_ok(), "editor window should remain available");
+}
+
+#[gpui::test]
+fn test_review_follow_ups_preserve_the_draft_and_append_to_the_original_comment(
+    cx: &mut TestAppContext,
+) {
+    use super::git::ReviewMessage;
+
+    init_test(cx, |_| {});
+    let editor = cx.add_window(|window, cx| Editor::single_line(window, cx));
+
+    editor
+        .update(cx, |editor, window, cx| {
+            editor.set_text("original line", window, cx);
+            let row = DisplayRow(0);
+            editor.show_diff_review_overlay(row..row, window, cx);
+            let prompt = editor.diff_review_prompt_editor().unwrap().clone();
+            prompt.update(cx, |prompt, cx| {
+                prompt.set_text("Original question", window, cx)
+            });
+            editor.submit_diff_review_comment(window, cx);
+
+            let overlay = &editor.diff_review_overlays[0];
+            let comment_id = overlay.comment_id.unwrap();
+            let block_id = overlay.block_id;
+            let key = test_hunk_key_with_anchor(
+                "",
+                editor
+                    .buffer()
+                    .read(cx)
+                    .snapshot(cx)
+                    .anchor_before(Point::new(0, 0)),
+            );
+            let thread_id = uuid::Uuid::new_v4();
+            editor.begin_diff_review(&[comment_id], cx);
+            editor.finish_diff_review(
+                &[comment_id],
+                thread_id,
+                "Claude".into(),
+                Some(&HashMap::from_iter([(
+                    comment_id,
+                    "Original answer".into(),
+                )])),
+                cx,
+            );
+            assert!(editor.diff_review_reply(comment_id, cx).is_none());
+            editor.open_diff_review_reply(comment_id, window, cx);
+            assert!(editor.diff_review_reply(comment_id, cx).is_none());
+            prompt.update(cx, |prompt, cx| prompt.set_text("My follow-up", window, cx));
+            assert_eq!(
+                editor.diff_review_reply(comment_id, cx),
+                Some((thread_id, "My follow-up".into()))
+            );
+            editor.close_diff_review_overlay(block_id, window, cx);
+            assert!(editor.diff_review_reply(comment_id, cx).is_none());
+            editor.set_diff_review_comments_expanded(true, cx);
+
+            let (actual_thread, draft) = editor.diff_review_reply(comment_id, cx).unwrap();
+            assert_eq!(actual_thread, thread_id);
+            editor.begin_diff_review_reply(comment_id, draft, window, cx);
+            assert!(editor.diff_review_reply(comment_id, cx).is_none());
+            editor.finish_diff_review_reply(comment_id, thread_id, None, window, cx);
+            let (_, draft) = editor.diff_review_reply(comment_id, cx).unwrap();
+            assert_eq!(draft, "My follow-up");
+
+            editor.begin_diff_review_reply(comment_id, draft, window, cx);
+            editor.finish_diff_review_reply(
+                comment_id,
+                thread_id,
+                Some("Follow-up answer".into()),
+                window,
+                cx,
+            );
+            assert!(editor.diff_review_reply(comment_id, cx).is_none());
+            let snapshot = editor.buffer().read(cx).snapshot(cx);
+            let comments = editor.comments_for_hunk(&key, &snapshot);
+            assert_eq!(comments[0].status, ReviewCommentStatus::Sent);
+            let conversation = comments[0].conversation.as_ref().unwrap();
+            assert_eq!(conversation.thread_id, thread_id);
+            assert_eq!(
+                conversation.messages,
+                [
+                    ReviewMessage::Agent("Original answer".into()),
+                    ReviewMessage::User("My follow-up".into()),
+                    ReviewMessage::Agent("Follow-up answer".into()),
+                ]
+            );
+            editor.open_diff_review_reply(comment_id, window, cx);
+            assert!(editor.diff_review_reply(comment_id, cx).is_none());
+        })
+        .unwrap();
 }
 
 #[gpui::test]

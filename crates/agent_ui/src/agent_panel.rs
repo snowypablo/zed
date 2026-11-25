@@ -104,6 +104,8 @@ use workspace::{
     item::{ItemEvent, ItemHandle},
 };
 
+type DiffReviewResult = futures::channel::oneshot::Receiver<Result<String>>;
+
 const AGENT_PANEL_KEY: &str = "agent_panel";
 const MIN_PANEL_WIDTH: Pixels = px(300.);
 const LAST_USED_AGENT_KEY: &str = "agent_panel__last_used_external_agent";
@@ -3276,21 +3278,8 @@ impl AgentPanel {
         prompt: String,
         window: &mut Window,
         cx: &mut Context<Self>,
-    ) -> Result<futures::channel::oneshot::Receiver<Result<String>>> {
-        let project = self.project.read(cx);
-        if !project.is_local() {
-            anyhow::bail!("External review agents require a local project.");
-        }
-        if !project
-            .agent_server_store()
-            .read(cx)
-            .external_agents()
-            .any(|id| id == &agent)
-        {
-            anyhow::bail!(
-                "Install the selected agent from the Zed ACP Registry, then run the review again."
-            );
-        }
+    ) -> Result<(ThreadId, DiffReviewResult)> {
+        self.ensure_diff_review_agent(&agent, cx)?;
         let options = CreateThreadOptions {
             title: Some("Address diff review".into()),
             initial_content: Some(AgentInitialContent::ContentBlock {
@@ -3311,7 +3300,73 @@ impl AgentPanel {
         conversation.update(cx, |conversation, _| {
             conversation.diff_review_result = Some(result_sender)
         });
+        Ok((thread_id, result))
+    }
+
+    pub fn continue_diff_review(
+        &mut self,
+        thread_id: ThreadId,
+        prompt: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Result<DiffReviewResult> {
+        let (sender, result) = futures::channel::oneshot::channel();
+        let blocks = vec![acp_v2::ContentBlock::Text(acp_v2::TextContent::new(prompt))];
+        let view = self
+            .active_conversation_view()
+            .filter(|view| view.read(cx).thread_id == thread_id)
+            .or_else(|| self.retained_threads.get(&thread_id));
+        if let Some(view) = view {
+            view.update(cx, |view, cx| {
+                view.continue_diff_review(blocks, sender, window, cx)
+            })?;
+        } else {
+            let metadata = ThreadMetadataStore::try_global(cx)
+                .and_then(|store| store.read(cx).entry(thread_id).cloned())
+                .filter(|metadata| metadata.session_id.is_some())
+                .context("The original review session is unavailable.")?;
+            self.ensure_diff_review_agent(&metadata.agent_id, cx)?;
+            let agent = Agent::from(metadata.agent_id.clone());
+            let selected_agent = self.selected_agent.clone();
+            let thread = self.create_agent_thread_with_server(
+                agent,
+                None,
+                Some(thread_id),
+                Some(metadata.folder_paths().clone()),
+                metadata.title(),
+                Some(AgentInitialContent::ContentBlock {
+                    blocks,
+                    auto_submit: true,
+                }),
+                None,
+                AgentThreadSource::GitPanel,
+                window,
+                cx,
+            );
+            self.set_selected_agent_and_persist(selected_agent, cx);
+            thread.conversation_view.update(cx, |conversation, _| {
+                conversation.diff_review_result = Some(sender);
+            });
+            self.insert_retained_thread(thread_id, thread.conversation_view, cx);
+        }
         Ok(result)
+    }
+
+    fn ensure_diff_review_agent(&self, agent: &AgentId, cx: &App) -> Result<()> {
+        let project = self.project.read(cx);
+        anyhow::ensure!(
+            project.is_local(),
+            "External review agents require a local project."
+        );
+        anyhow::ensure!(
+            project
+                .agent_server_store()
+                .read(cx)
+                .external_agents()
+                .any(|installed| installed == agent),
+            "Install the review agent from the Zed ACP Registry, then try again."
+        );
+        Ok(())
     }
 
     pub fn activate_retained_thread(
@@ -4317,6 +4372,7 @@ impl AgentPanel {
                 if matches!(
                     event,
                     AcpThreadEvent::StatusChanged
+                        | AcpThreadEvent::Stopped { .. }
                         | AcpThreadEvent::SubmissionUpdated(_)
                         | AcpThreadEvent::ToolAuthorizationReceived(_)
                         | AcpThreadEvent::ElicitationResponded(_)
@@ -4348,7 +4404,10 @@ impl AgentPanel {
             .iter()
             .filter(|(_id, view)| {
                 let view = view.read(cx);
-                if view.has_pending_selections() || view.has_saved_input() {
+                if view.has_pending_selections()
+                    || view.has_saved_input()
+                    || view.diff_review_result.is_some()
+                {
                     return false;
                 }
                 let Some(thread_view) = view.root_thread_view() else {

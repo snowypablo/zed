@@ -2354,6 +2354,34 @@ impl ThreadView {
         Ok(())
     }
 
+    pub(super) fn send_diff_review_follow_up(
+        &mut self,
+        content: Vec<acp_v2::ContentBlock>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> anyhow::Result<()> {
+        let thread = self.thread.read(cx);
+        anyhow::ensure!(
+            !thread.is_observation_closed(),
+            "The review agent has disconnected. Reconnect from Threads, then try again."
+        );
+        anyhow::ensure!(
+            thread.status() == ThreadStatus::Idle
+                && !thread.has_unsettled_submissions()
+                && !self.is_loading_contents
+                && self.message_queue.is_empty(),
+            "The review session is busy. Try again when it finishes."
+        );
+        cx.emit(AcpThreadViewEvent::Interacted);
+        self.send_content(
+            Task::ready(Ok(Some((content, Vec::new())))),
+            false,
+            window,
+            cx,
+        );
+        Ok(())
+    }
+
     /// Sends a bare `/command` turn and queues everything the user typed after
     /// it as a follow-up message. The queued remainder auto-processes when the
     /// command turn stops, so e.g. `/compact do X` compacts and then runs `do X`

@@ -44,6 +44,18 @@ impl ThreadId {
     }
 }
 
+impl From<ThreadId> for uuid::Uuid {
+    fn from(id: ThreadId) -> Self {
+        id.0
+    }
+}
+
+impl From<uuid::Uuid> for ThreadId {
+    fn from(id: uuid::Uuid) -> Self {
+        Self(id)
+    }
+}
+
 impl Bind for ThreadId {
     fn bind(&self, statement: &Statement, start_index: i32) -> anyhow::Result<i32> {
         self.0.bind(statement, start_index)

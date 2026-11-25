@@ -247,11 +247,25 @@ pub(super) struct StoredReviewComment {
     /// Anchors for the code range being reviewed.
     pub(super) range: Range<Anchor>,
     excerpt: Arc<str>,
-    pub(super) agent_reply: Option<(SharedString, String)>,
+    pub(super) conversation: Option<ReviewConversation>,
     /// Whether this comment is currently being edited inline.
     pub(super) is_editing: bool,
     /// Lifecycle status for the local draft thread.
     pub(super) status: ReviewCommentStatus,
+}
+
+#[derive(Clone)]
+pub(super) struct ReviewConversation {
+    pub(super) thread_id: uuid::Uuid,
+    pub(super) agent: SharedString,
+    pub(super) messages: Vec<ReviewMessage>,
+    pending_reply: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) enum ReviewMessage {
+    User(String),
+    Agent(String),
 }
 
 pub(super) struct DiffReviewOverlay {
@@ -262,6 +276,7 @@ pub(super) struct DiffReviewOverlay {
     pub(super) comment_id: Option<usize>,
     pub(super) comments_expanded: bool,
     inline_edit: Option<(Entity<Editor>, Subscription)>,
+    pub(super) composing_reply: bool,
     user_avatar_uri: Option<SharedUri>,
     _subscription: Subscription,
 }
@@ -291,7 +306,7 @@ impl StoredReviewComment {
             comment,
             range,
             excerpt: excerpt.into(),
-            agent_reply: None,
+            conversation: None,
             is_editing: false,
             status: ReviewCommentStatus::Draft,
         }
@@ -740,6 +755,7 @@ impl Editor {
             comment_id: None,
             comments_expanded: true,
             inline_edit: None,
+            composing_reply: false,
             user_avatar_uri,
             _subscription: subscription,
         });
@@ -752,11 +768,19 @@ impl Editor {
     }
 
     pub fn submit_diff_review_comment(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if let Some(overlay) = self.diff_review_overlays.iter().find(|overlay| {
-            overlay.comment_id.is_none()
-                && overlay.prompt_editor.focus_handle(cx).is_focused(window)
-        }) {
-            self.submit_diff_review_overlay(overlay.block_id, window, cx);
+        let Some(overlay) = self
+            .diff_review_overlays
+            .iter()
+            .find(|overlay| overlay.prompt_editor.focus_handle(cx).is_focused(window))
+        else {
+            return;
+        };
+        match overlay.comment_id {
+            None => self.submit_diff_review_overlay(overlay.block_id, window, cx),
+            Some(id) if overlay.composing_reply => {
+                window.dispatch_action(Box::new(crate::actions::ReplyToDiffReview { id }), cx);
+            }
+            Some(_) => {}
         }
     }
 
@@ -786,10 +810,15 @@ impl Editor {
             overlay.anchor_range.clone(),
             cx,
         );
-        self.diff_review_overlays[index].comment_id = Some(id);
+        let overlay = &mut self.diff_review_overlays[index];
+        overlay.comment_id = Some(id);
         if restore_focus {
             window.focus(&self.focus_handle, cx);
         }
+        overlay.prompt_editor.update(cx, |editor, cx| {
+            editor.set_text("", window, cx);
+            editor.set_placeholder_text("Reply to the review agent…", window, cx);
+        });
     }
 
     pub fn diff_review_prompt_editor(&self) -> Option<&Entity<Editor>> {
@@ -942,9 +971,9 @@ impl Editor {
     pub fn finish_diff_review(
         &mut self,
         comment_ids: &[usize],
+        thread_id: uuid::Uuid,
         agent: SharedString,
         replies: Option<&HashMap<usize, String>>,
-        _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         let snapshot = self.buffer.read(cx).snapshot(cx);
@@ -959,8 +988,18 @@ impl Editor {
                 } else {
                     ReviewCommentStatus::Draft
                 };
-                if let Some(reply) = replies.and_then(|replies| replies.get(&comment.id)) {
-                    comment.agent_reply = Some((agent.clone(), reply.clone()));
+                if let Some(replies) = replies {
+                    comment.conversation = Some(ReviewConversation {
+                        thread_id,
+                        agent: agent.clone(),
+                        messages: replies
+                            .get(&comment.id)
+                            .cloned()
+                            .map(ReviewMessage::Agent)
+                            .into_iter()
+                            .collect(),
+                        pending_reply: None,
+                    });
                 }
             }
         }
@@ -968,6 +1007,116 @@ impl Editor {
             total_count: self.total_review_comment_count(),
         });
         cx.notify();
+    }
+
+    pub fn diff_review_reply(&self, comment_id: usize, cx: &App) -> Option<(uuid::Uuid, String)> {
+        let conversation = self.review_comment(comment_id)?.conversation.as_ref()?;
+        if conversation.pending_reply.is_some() {
+            return None;
+        }
+        let overlay = self.diff_review_overlays.iter().find(|overlay| {
+            overlay.comment_id == Some(comment_id)
+                && overlay.comments_expanded
+                && overlay.composing_reply
+        })?;
+        let body = overlay.prompt_editor.read(cx).text(cx);
+        let body = body.trim();
+        (!body.is_empty()).then(|| (conversation.thread_id, body.to_owned()))
+    }
+
+    pub fn begin_diff_review_reply(
+        &mut self,
+        comment_id: usize,
+        body: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(conversation) = self.review_conversation_mut(comment_id) {
+            conversation.pending_reply = Some(body);
+            self.blur_diff_review_reply(comment_id, window, cx);
+            cx.notify();
+        }
+    }
+
+    pub fn finish_diff_review_reply(
+        &mut self,
+        comment_id: usize,
+        thread_id: uuid::Uuid,
+        reply: Option<String>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(conversation) = self
+            .review_conversation_mut(comment_id)
+            .filter(|conversation| conversation.thread_id == thread_id)
+        else {
+            return;
+        };
+        let Some(body) = conversation.pending_reply.take() else {
+            return;
+        };
+        if let Some(reply) = reply {
+            conversation.messages.push(ReviewMessage::User(body));
+            conversation.messages.push(ReviewMessage::Agent(reply));
+            if let Some(overlay) = self
+                .diff_review_overlays
+                .iter_mut()
+                .find(|overlay| overlay.comment_id == Some(comment_id))
+            {
+                overlay.composing_reply = false;
+                overlay
+                    .prompt_editor
+                    .update(cx, |editor, cx| editor.set_text("", window, cx));
+            }
+        }
+        cx.notify();
+    }
+
+    fn review_conversation_mut(&mut self, comment_id: usize) -> Option<&mut ReviewConversation> {
+        self.stored_review_comments
+            .iter_mut()
+            .flat_map(|(_, comments)| comments)
+            .find(|comment| comment.id == comment_id)?
+            .conversation
+            .as_mut()
+    }
+
+    pub(super) fn open_diff_review_reply(
+        &mut self,
+        comment_id: usize,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if !self
+            .review_comment(comment_id)
+            .and_then(|comment| comment.conversation.as_ref())
+            .is_some_and(|conversation| conversation.pending_reply.is_none())
+        {
+            return;
+        }
+        if let Some(overlay) = self
+            .diff_review_overlays
+            .iter_mut()
+            .find(|overlay| overlay.comment_id == Some(comment_id))
+        {
+            overlay.composing_reply = true;
+            window.focus(&overlay.prompt_editor.focus_handle(cx), cx);
+            cx.notify();
+        }
+    }
+
+    fn blur_diff_review_reply(
+        &self,
+        comment_id: usize,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.diff_review_overlays.iter().any(|overlay| {
+            overlay.comment_id == Some(comment_id)
+                && overlay.prompt_editor.focus_handle(cx).is_focused(window)
+        }) {
+            window.focus(&self.focus_handle, cx);
+        }
     }
 
     /// Adds a new review comment to a specific hunk.
@@ -1473,11 +1622,19 @@ impl Editor {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> bool {
-        for overlay in &self.diff_review_overlays {
+        for overlay in &mut self.diff_review_overlays {
             if overlay.comment_id.is_none()
                 && overlay.prompt_editor.focus_handle(cx).is_focused(window)
             {
-                self.close_diff_review_overlay(overlay.block_id, window, cx);
+                let block_id = overlay.block_id;
+                self.close_diff_review_overlay(block_id, window, cx);
+                return true;
+            }
+            if overlay.composing_reply && overlay.prompt_editor.focus_handle(cx).is_focused(window)
+            {
+                overlay.composing_reply = false;
+                window.focus(&self.focus_handle, cx);
+                cx.notify();
                 return true;
             }
             if let Some(comment_id) = overlay.comment_id
@@ -1533,6 +1690,7 @@ impl Editor {
         };
         if let Some(comment_id) = overlay.comment_id {
             overlay.comments_expanded = false;
+            self.blur_diff_review_reply(comment_id, window, cx);
             self.cancel_edit_review_comment(comment_id, window, cx);
             cx.notify();
         } else {
@@ -2759,6 +2917,16 @@ impl Editor {
                 .into_any_element();
         }
 
+        let conversation_element = comment.conversation.as_ref().map(|conversation| {
+            Self::render_diff_review_conversation(
+                conversation,
+                overlay,
+                comment_id,
+                &editor_handle,
+                colors,
+            )
+        });
+
         let close = IconButton::new("diff-review-collapse", IconName::Close)
             .icon_color(ui::Color::Muted)
             .icon_size(action_icon_size)
@@ -2772,7 +2940,7 @@ impl Editor {
                     .log_err();
             });
         root.child(Self::render_comment_row(
-            comment.clone(),
+            comment,
             overlay
                 .inline_edit
                 .as_ref()
@@ -2782,18 +2950,100 @@ impl Editor {
             action_icon_size,
             colors,
             close,
+            conversation_element,
         ))
         .into_any_element()
     }
 
+    fn render_diff_review_conversation(
+        conversation: &ReviewConversation,
+        overlay: &DiffReviewOverlay,
+        comment_id: usize,
+        editor: &WeakEntity<Editor>,
+        colors: &theme::ThemeColors,
+    ) -> AnyElement {
+        let message = |author: SharedString, body: String| {
+            v_flex()
+                .w_full()
+                .child(
+                    Label::new(author)
+                        .size(LabelSize::Small)
+                        .color(Color::Muted),
+                )
+                .child(div().w_full().text_sm().text_color(colors.text).child(body))
+        };
+
+        v_flex()
+            .min_w_0()
+            .mt_1()
+            .pl_2()
+            .gap_1()
+            .border_l_1()
+            .border_color(colors.border)
+            .children(conversation.messages.iter().map(|entry| match entry {
+                ReviewMessage::User(body) => message("You".into(), body.clone()),
+                ReviewMessage::Agent(body) => message(conversation.agent.clone(), body.clone()),
+            }))
+            .child(if let Some(body) = &conversation.pending_reply {
+                v_flex()
+                    .gap_1()
+                    .child(message("You".into(), body.clone()))
+                    .child(
+                        Label::new(format!("Waiting for {}…", conversation.agent))
+                            .size(LabelSize::Small)
+                            .color(Color::Muted),
+                    )
+                    .into_any_element()
+            } else if overlay.composing_reply {
+                h_flex()
+                    .gap_1()
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .border_1()
+                            .border_color(colors.border)
+                            .rounded_md()
+                            .bg(colors.editor_background)
+                            .px_2()
+                            .py_0p5()
+                            .child(overlay.prompt_editor.clone()),
+                    )
+                    .child(Button::new("diff-review-send-reply", "Send").on_click(
+                        move |_, window, cx| {
+                            window.dispatch_action(
+                                Box::new(crate::actions::ReplyToDiffReview { id: comment_id }),
+                                cx,
+                            );
+                        },
+                    ))
+                    .into_any_element()
+            } else {
+                let editor = editor.clone();
+                h_flex()
+                    .child(Button::new("diff-review-reply", "Reply").on_click(
+                        move |_, window, cx| {
+                            editor
+                                .update(cx, |editor, cx| {
+                                    editor.open_diff_review_reply(comment_id, window, cx);
+                                })
+                                .log_err();
+                        },
+                    ))
+                    .into_any_element()
+            })
+            .into_any_element()
+    }
+
     fn render_comment_row(
-        comment: StoredReviewComment,
+        comment: &StoredReviewComment,
         inline_editor: Option<Entity<Editor>>,
         user_avatar_uri: Option<SharedUri>,
         avatar_size: Pixels,
         action_icon_size: IconSize,
         colors: &theme::ThemeColors,
         close: IconButton,
+        conversation_element: Option<AnyElement>,
     ) -> impl IntoElement {
         let comment_id = comment.id;
         let is_editing = inline_editor.is_some();
@@ -2885,27 +3135,10 @@ impl Editor {
                             .w_full()
                             .text_sm()
                             .text_color(colors.text)
-                            .child(comment.comment)
+                            .child(comment.comment.clone())
                             .into_any_element()
                     })
-                    .when_some(comment.agent_reply, |this, (agent, reply)| {
-                        this.child(
-                            v_flex()
-                                .min_w_0()
-                                .mt_1()
-                                .pl_2()
-                                .border_l_1()
-                                .border_color(colors.border)
-                                .child(Label::new(agent).size(LabelSize::Small).color(Color::Muted))
-                                .child(
-                                    div()
-                                        .w_full()
-                                        .text_sm()
-                                        .text_color(colors.text)
-                                        .child(reply),
-                                ),
-                        )
-                    }),
+                    .children(conversation_element),
             )
             .child(if is_editing {
                 h_flex()

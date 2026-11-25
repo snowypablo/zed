@@ -1,7 +1,10 @@
 use agent_ui::AgentPanel;
 use anyhow::{Context as _, Result, ensure};
 use collections::HashMap;
-use editor::{Editor, actions::RunDiffReview};
+use editor::{
+    Editor,
+    actions::{ReplyToDiffReview, RunDiffReview},
+};
 use git_ui::ReviewAgent;
 use gpui::{Context, TaskExt as _, Window};
 use serde::Deserialize;
@@ -50,7 +53,7 @@ pub(super) fn run_diff_review(
             panel.run_diff_review(agent.id().into(), &worktree, prompt, window, cx)
         })
     })();
-    let run = match start {
+    let (thread_id, run) = match start {
         Ok(run) => run,
         Err(error) => {
             workspace.show_error(error.to_string(), cx);
@@ -75,14 +78,14 @@ pub(super) fn run_diff_review(
             .and_then(|result| result)
             .and_then(|response| parse_replies(&response, &comment_ids));
 
-        workspace.update_in(cx, |workspace, window, cx| {
+        workspace.update_in(cx, |workspace, _, cx| {
             if let Some(editor) = editor.upgrade() {
                 editor.update(cx, |editor, cx| {
                     editor.finish_diff_review(
                         &comment_ids,
+                        thread_id.into(),
                         agent_name.into(),
                         result.as_ref().ok(),
-                        window,
                         cx,
                     );
                 });
@@ -100,6 +103,71 @@ pub(super) fn run_diff_review(
                     );
                 }
                 Err(error) => workspace.show_error(error.to_string(), cx),
+            }
+        })
+    })
+    .detach_and_log_err(cx);
+}
+
+pub(super) fn reply_to_diff_review(
+    workspace: &mut Workspace,
+    action: &ReplyToDiffReview,
+    window: &mut Window,
+    cx: &mut Context<Workspace>,
+) {
+    let Some(editor) = workspace
+        .active_item(cx)
+        .and_then(|item| item.act_as::<Editor>(cx))
+    else {
+        return;
+    };
+    let comment_id = action.id;
+    let Some((thread_id, body)) = editor.read(cx).diff_review_reply(comment_id, cx) else {
+        return;
+    };
+    let prompt = format!(
+        "Continue the inline review discussion for the original comment with ID {comment_id}. Use our conversation about that comment for context. If the reviewer asks only for an explanation, leave the code alone. Leave any requested edits uncommitted. End your final assistant message with a fenced json code block containing an object with a replies array. Include exactly one reply with the integer id {comment_id} and a body string containing only the concise response to post inline. Keep progress updates, working notes, and commentary outside the body.
+
+{body}"
+    );
+    let run = workspace
+        .panel::<AgentPanel>(cx)
+        .context("The Agent Panel is unavailable.")
+        .and_then(|panel| {
+            panel.update(cx, |panel, cx| {
+                panel.continue_diff_review(thread_id.into(), prompt, window, cx)
+            })
+        });
+    let run = match run {
+        Ok(run) => run,
+        Err(error) => {
+            workspace.show_error(error.to_string(), cx);
+            return;
+        }
+    };
+    editor.update(cx, |editor, cx| {
+        editor.begin_diff_review_reply(comment_id, body, window, cx);
+    });
+
+    let editor = editor.downgrade();
+    cx.spawn_in(window, async move |workspace, cx| {
+        let result = run
+            .await
+            .context("The review session ended before returning a reply.")
+            .and_then(|result| result)
+            .and_then(|response| parse_follow_up(&response, comment_id));
+        workspace.update_in(cx, |workspace, window, cx| {
+            let (reply, error) = match result {
+                Ok(reply) => (Some(reply), None),
+                Err(error) => (None, Some(error)),
+            };
+            if let Some(editor) = editor.upgrade() {
+                editor.update(cx, |editor, cx| {
+                    editor.finish_diff_review_reply(comment_id, thread_id, reply, window, cx);
+                });
+            }
+            if let Some(error) = error {
+                workspace.show_error(error.to_string(), cx);
             }
         })
     })
@@ -145,9 +213,32 @@ fn parse_replies(response: &str, comment_ids: &[usize]) -> Result<HashMap<usize,
     Ok(replies)
 }
 
+fn parse_follow_up(response: &str, comment_id: usize) -> Result<String> {
+    parse_replies(response, &[comment_id])?
+        .remove(&comment_id)
+        .context("The review agent did not include a reply. See the review thread for details.")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn review_follow_up_posts_only_the_reply_body() {
+        let response = concat!(
+            "I'll inspect the parser, then post what changed.\n\n",
+            "```json\n",
+            r#"{"replies":[{"id":2,"body":"Handled empty input.\nThe tests passed."}]}"#,
+            "\n```",
+        );
+        assert_eq!(
+            parse_follow_up(response, 2).unwrap(),
+            "Handled empty input.\nThe tests passed."
+        );
+        assert!(parse_follow_up(response, 4).is_err());
+        assert!(parse_follow_up("I'll inspect the parser.", 2).is_err());
+        assert!(parse_follow_up(r#"{"replies":[]}"#, 2).is_err());
+    }
 
     #[test]
     fn review_replies_accept_only_the_submitted_ids() {

@@ -3,7 +3,8 @@ use acp_thread::{
     AuthRequired, ElicitationEntryId, ElicitationStatus, ElicitationStore, ForegroundActivity,
     LoadError, MaxOutputTokensError, MentionUri, PermissionOptionChoice, PermissionOptions,
     PermissionPattern, PermissionRequest, PermissionRequestId, ProtocolErrorInfo, RetryStatus,
-    SelectedPermissionOutcome, ThreadStatus, ToolCall, ToolCallContent, ToolCallStatus,
+    SelectedPermissionOutcome, SubmissionState, ThreadStatus, ToolCall, ToolCallContent,
+    ToolCallStatus,
 };
 use acp_thread::{AgentConnection, Plan};
 use action_log::{ActionLog, ActionLogTelemetry, DiffStats};
@@ -1791,6 +1792,34 @@ impl ConversationView {
         })
     }
 
+    pub(crate) fn continue_diff_review(
+        &mut self,
+        blocks: Vec<acp_v2::ContentBlock>,
+        result: futures::channel::oneshot::Sender<Result<String>>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Result<()> {
+        anyhow::ensure!(
+            self.diff_review_result.is_none(),
+            "The agent is still addressing a comment from this review. Try again when it finishes."
+        );
+        let connected = self
+            .as_connected()
+            .context("The review agent is reconnecting. Try again when it is ready.")?;
+        anyhow::ensure!(
+            connected.auth_state.is_ok(),
+            "Sign in to the review agent from Threads, then try again."
+        );
+        let view = self
+            .root_thread_view()
+            .context("The original review session is unavailable.")?;
+        view.update(cx, |view, cx| {
+            view.send_diff_review_follow_up(blocks, window, cx)
+        })?;
+        self.diff_review_result = Some(result);
+        Ok(())
+    }
+
     fn handle_auth_required(
         this: WeakEntity<Self>,
         err: AuthRequired,
@@ -1799,6 +1828,13 @@ impl ConversationView {
         cx: &mut App,
     ) {
         this.update(cx, |this, cx| {
+            if let Some(result) = this.diff_review_result.take() {
+                result
+                    .send(Err(anyhow!(
+                        "Sign in to the review agent from Threads, then try again."
+                    )))
+                    .ok();
+            }
             let description = err
                 .description
                 .map(|desc| cx.new(|cx| Markdown::new(desc.into(), None, None, cx)));
@@ -1994,6 +2030,22 @@ impl ConversationView {
                     stop_reason: Some(acp_v2::StopReason::EndTurn),
                     ..
                 } => Some(Ok(diff_review_response(thread.read(cx)))),
+                AcpThreadEvent::SubmissionUpdated(id) => {
+                    let thread = thread.read(cx);
+                    if thread.latest_submission_id() == Some(*id) {
+                        match thread.submission(*id).map(|submission| &submission.state) {
+                            Some(SubmissionState::Failed(error)) => Some(Err(anyhow!(
+                                "The review agent could not send the message. {error}"
+                            ))),
+                            Some(
+                                SubmissionState::Cancelled | SubmissionState::Disconnected { .. },
+                            ) => Some(Err(anyhow!("The review message did not finish sending."))),
+                            _ => None,
+                        }
+                    } else {
+                        None
+                    }
+                }
                 AcpThreadEvent::Stopped { .. }
                 | AcpThreadEvent::Error
                 | AcpThreadEvent::ConnectionLost

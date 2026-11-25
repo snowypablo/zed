@@ -1041,6 +1041,14 @@ impl Default for FindAllReferences {
     }
 }
 
+/// Sends a reply in an inline review conversation.
+#[derive(PartialEq, Clone, Deserialize, JsonSchema, Action)]
+#[action(namespace = editor)]
+#[serde(deny_unknown_fields)]
+pub struct ReplyToDiffReview {
+    pub id: usize,
+}
+
 /// Edits a stored review comment inline.
 #[derive(PartialEq, Clone, Deserialize, JsonSchema, Action)]
 #[action(namespace = editor)]
