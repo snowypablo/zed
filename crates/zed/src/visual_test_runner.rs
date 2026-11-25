@@ -1832,6 +1832,7 @@ import { AiPaneTabContext } from 'context';
             if let Some(editor) = editors.into_iter().next() {
                 editor.update(cx, |editor, cx| {
                     // Add second comment
+                    editor.show_diff_review_overlay(DisplayRow(1)..DisplayRow(1), window, cx);
                     if let Some(prompt_editor) = editor.diff_review_prompt_editor().cloned() {
                         prompt_editor.update(cx, |pe, cx| {
                             pe.insert("Second comment about imports", window, cx);
@@ -1840,6 +1841,7 @@ import { AiPaneTabContext } from 'context';
                     editor.submit_diff_review_comment(window, cx);
 
                     // Add third comment
+                    editor.show_diff_review_overlay(DisplayRow(1)..DisplayRow(1), window, cx);
                     if let Some(prompt_editor) = editor.diff_review_prompt_editor().cloned() {
                         prompt_editor.update(cx, |pe, cx| {
                             pe.insert("Third comment about naming conventions", window, cx);

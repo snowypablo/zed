@@ -1,13 +1,13 @@
 use crate::{
     diff_multibuffer::DiffMultibuffer,
     git_panel::{GitPanel, GitPanelAddon, GitStatusEntry},
-    project_diff::render_send_review_to_agent_button,
+    project_diff::render_run_review_button,
 };
 use anyhow::{Context as _, Result};
 use buffer_diff::DiffHunkStatus;
 use editor::{
     DiffHunkRenderer, Editor, EditorEvent, SplittableEditor,
-    actions::{GoToHunk, GoToPreviousHunk, SendReviewToAgent},
+    actions::{GoToHunk, GoToPreviousHunk, RunDiffReview},
 };
 use git::{StageAll, StageAndNext};
 use gpui::{
@@ -682,11 +682,9 @@ impl Render for UnstagedDiffToolbar {
             })
             .when(review_count > 0, |this| {
                 this.child(
-                    render_send_review_to_agent_button(review_count, &focus_handle).on_click(
-                        cx.listener(|this, _, window, cx| {
-                            this.dispatch_action(&SendReviewToAgent, window, cx)
-                        }),
-                    ),
+                    render_run_review_button(review_count, &focus_handle).on_click(cx.listener(
+                        |this, _, window, cx| this.dispatch_action(&RunDiffReview, window, cx),
+                    )),
                 )
                 .child(Divider::vertical())
             })

@@ -67,7 +67,7 @@ use chrono::{DateTime, Utc};
 use client::UserStore;
 use cloud_api_types::Plan;
 use collections::HashMap;
-use editor::{Editor, MultiBuffer, ReviewFeedback};
+use editor::{Editor, MultiBuffer};
 use extension_host::ExtensionStore;
 use feature_flags::{CreateThreadToolFeatureFlag, FeatureFlagAppExt as _};
 
@@ -3269,6 +3269,51 @@ impl AgentPanel {
         thread_id
     }
 
+    pub fn run_diff_review(
+        &mut self,
+        agent: project::AgentId,
+        worktree: &std::path::Path,
+        prompt: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Result<futures::channel::oneshot::Receiver<Result<String>>> {
+        let project = self.project.read(cx);
+        if !project.is_local() {
+            anyhow::bail!("External review agents require a local project.");
+        }
+        if !project
+            .agent_server_store()
+            .read(cx)
+            .external_agents()
+            .any(|id| id == &agent)
+        {
+            anyhow::bail!(
+                "Install the selected agent from the Zed ACP Registry, then run the review again."
+            );
+        }
+        let options = CreateThreadOptions {
+            title: Some("Address diff review".into()),
+            initial_content: Some(AgentInitialContent::ContentBlock {
+                blocks: vec![acp_v2::ContentBlock::Text(acp_v2::TextContent::new(prompt))],
+                auto_submit: true,
+            }),
+            agent: Some(agent.into()),
+            work_dirs: Some(PathList::new(&[worktree])),
+            ..Default::default()
+        };
+        let thread_id =
+            self.create_thread_with_options(options, AgentThreadSource::GitPanel, window, cx);
+        let conversation = self
+            .retained_threads
+            .get(&thread_id)
+            .context("Review thread was not retained")?;
+        let (result_sender, result) = futures::channel::oneshot::channel();
+        conversation.update(cx, |conversation, _| {
+            conversation.diff_review_result = Some(result_sender)
+        });
+        Ok(result)
+    }
+
     pub fn activate_retained_thread(
         &mut self,
         id: ThreadId,
@@ -4153,21 +4198,6 @@ impl AgentPanel {
     pub fn active_thread_view(&self, cx: &App) -> Option<Entity<ThreadView>> {
         let server_view = self.active_conversation_view()?;
         server_view.read(cx).root_thread_view()
-    }
-
-    pub fn send_review_feedback(
-        &mut self,
-        feedback: Vec<ReviewFeedback>,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) -> Result<bool> {
-        let Some(thread_view) = self.active_thread_view(cx) else {
-            return Ok(false);
-        };
-        thread_view.update(cx, |thread_view, cx| {
-            thread_view.send_review_feedback(feedback, window, cx)
-        })?;
-        Ok(true)
     }
 
     pub fn active_agent_thread(&self, cx: &App) -> Option<Entity<AcpThread>> {

@@ -3596,10 +3596,7 @@ impl Editor {
             self.cancel_diff_review_drag(cx);
             dismissed = true;
         }
-        if !self.diff_review_overlays.is_empty() {
-            self.dismiss_all_diff_review_overlays(cx);
-            dismissed = true;
-        }
+        dismissed |= self.dismiss_focused_diff_review_overlay(window, cx);
 
         if self.mode.is_full() && self.has_active_diagnostic_group() {
             self.dismiss_diagnostics(cx);
@@ -10272,6 +10269,7 @@ impl Editor {
                 cx.notify();
             }
             multi_buffer::Event::Reloaded | multi_buffer::Event::BufferDiffChanged => {
+                self.cleanup_orphaned_review_comments(cx);
                 cx.emit(EditorEvent::TitleChanged)
             }
             multi_buffer::Event::DiagnosticsUpdated => {

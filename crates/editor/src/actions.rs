@@ -935,8 +935,8 @@ actions!(
         SubmitDiffReviewComment,
         /// Toggles the expanded state of the comments section in the overlay.
         ToggleReviewCommentsExpanded,
-        /// Sends all stored review comments to the Agent panel.
-        SendReviewToAgent,
+        /// Starts an external agent session to address the diff's draft review comments.
+        RunDiffReview,
         /// Toggles the selection menu.
         ToggleSelectionMenu,
         /// Toggles soft wrap mode.

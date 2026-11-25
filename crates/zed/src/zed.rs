@@ -1,5 +1,6 @@
 mod app_menus;
 pub mod edit_prediction_registry;
+mod inline_review;
 #[cfg(target_os = "macos")]
 pub(crate) mod mac_only_instance;
 mod migrate;
@@ -25,7 +26,7 @@ use breadcrumbs::Breadcrumbs;
 use client::zed_urls;
 use collections::VecDeque;
 use debugger_ui::debugger_panel::DebugPanel;
-use editor::{Editor, MultiBuffer, actions::SendReviewToAgent};
+use editor::{Editor, MultiBuffer};
 use extension_host::ExtensionStore;
 use feature_flags::{FeatureFlagAppExt as _, PanicFeatureFlag};
 use fs::Fs;
@@ -920,46 +921,7 @@ fn register_actions(
 ) {
     workspace
         .register_action(|_, _: &OpenDocs, _, cx| cx.open_url(DOCS_URL))
-        .register_action(
-            |workspace: &mut Workspace,
-             _: &SendReviewToAgent,
-             window: &mut Window,
-             cx: &mut Context<Workspace>| {
-                let Some(review_editor) = workspace
-                    .active_item(cx)
-                    .and_then(|item| item.act_as::<Editor>(cx))
-                else {
-                    return;
-                };
-                let feedback = review_editor.read(cx).review_feedback(cx);
-                if feedback.is_empty() {
-                    return;
-                }
-                let Some(agent_panel) = workspace.panel::<agent_ui::AgentPanel>(cx) else {
-                    workspace.show_error(
-                        "Open or create an agent thread before sending review feedback.",
-                        cx,
-                    );
-                    return;
-                };
-                match agent_panel.update(cx, |panel, cx| {
-                    panel.send_review_feedback(feedback, window, cx)
-                }) {
-                    Ok(true) => {
-                        review_editor.update(cx, |editor, cx| {
-                            editor.clear_review_feedback(cx);
-                        });
-                        workspace.reveal_panel::<agent_ui::AgentPanel>(window, cx);
-                    }
-                    Ok(false) => workspace.show_error(
-                        "Open or create an agent thread before sending review feedback.",
-                        cx,
-                    ),
-                    Err(error) => workspace
-                        .show_error(format!("Failed to send review feedback: {error}"), cx),
-                }
-            },
-        )
+        .register_action(inline_review::run_diff_review)
         .register_action(|_, _: &OpenStatusPage, _, cx| cx.open_url(STATUS_URL))
         .register_action(|_, _: &GetMerch, _, cx| cx.open_url(MERCH_URL))
         .register_action(

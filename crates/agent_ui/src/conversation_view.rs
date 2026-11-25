@@ -762,6 +762,37 @@ fn subagent_sessions_referenced_by_tool_calls(
     })
 }
 
+fn diff_review_response(thread: &AcpThread) -> String {
+    thread
+        .entries()
+        .iter()
+        .rev()
+        .take_while(|entry| !matches!(entry, AgentThreadEntry::UserMessage(_)))
+        .filter_map(|entry| match entry {
+            AgentThreadEntry::AssistantMessage(message) if !message.is_subagent_output => {
+                Some(message)
+            }
+            _ => None,
+        })
+        .map(|message| {
+            message
+                .chunks
+                .iter()
+                .filter_map(|chunk| match chunk {
+                    AssistantMessageChunk::Message { block, .. } => Some(block.source_blocks()),
+                    _ => None,
+                })
+                .flatten()
+                .filter_map(|block| match block {
+                    acp_v2::ContentBlock::Text(text) => Some(text.text.as_str()),
+                    _ => None,
+                })
+                .collect::<String>()
+        })
+        .find(|text| !text.trim().is_empty())
+        .unwrap_or_default()
+}
+
 fn affects_thread_metadata(event: &AcpThreadEvent) -> bool {
     match event {
         AcpThreadEvent::NewEntry
@@ -811,6 +842,7 @@ pub struct ConversationView {
     thread_store: Option<Entity<ThreadStore>>,
     pub(crate) thread_id: ThreadId,
     pub(crate) root_session_id: Option<acp_v2::SessionId>,
+    pub(crate) diff_review_result: Option<futures::channel::oneshot::Sender<Result<String>>>,
     server_state: ServerState,
     recovery: Option<ThreadRecovery>,
     saved_submissions: Vec<SavedSubmission>,
@@ -1130,6 +1162,7 @@ impl ConversationView {
             thread_store,
             thread_id,
             root_session_id: resume_session_id.clone(),
+            diff_review_result: None,
             server_state: Self::initial_state(
                 agent.clone(),
                 connection_store,
@@ -1823,6 +1856,9 @@ impl ConversationView {
                 self.focus_handle.focus(window, cx)
             }
         }
+        if let Some(result) = self.diff_review_result.take() {
+            result.send(Err(anyhow!(err.to_string()))).ok();
+        }
         self.emit_load_error_telemetry(&err);
         self.set_server_state(ServerState::LoadError { error: err }, cx);
     }
@@ -1952,6 +1988,26 @@ impl ConversationView {
             return;
         };
         let is_subagent = thread.read(cx).parent_session_id().is_some();
+        if !is_subagent && self.diff_review_result.is_some() {
+            let result = match event {
+                AcpThreadEvent::Stopped {
+                    stop_reason: Some(acp_v2::StopReason::EndTurn),
+                    ..
+                } => Some(Ok(diff_review_response(thread.read(cx)))),
+                AcpThreadEvent::Stopped { .. }
+                | AcpThreadEvent::Error
+                | AcpThreadEvent::ConnectionLost
+                | AcpThreadEvent::Refusal => Some(Err(anyhow!(
+                    "The review agent stopped before finishing. See the review thread for details."
+                ))),
+                _ => None,
+            };
+            if let Some(result) = result
+                && let Some(sender) = self.diff_review_result.take()
+            {
+                sender.send(result).ok();
+            }
+        }
         if !is_subagent && affects_thread_metadata(event) {
             cx.emit(RootThreadUpdated);
         }

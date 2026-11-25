@@ -47115,7 +47115,7 @@ fn test_review_comment_take_all(cx: &mut TestAppContext) {
 }
 
 #[gpui::test]
-fn test_review_feedback_preserves_anchor_metadata_until_cleared(cx: &mut TestAppContext) {
+fn test_review_feedback_attaches_the_reply_to_the_original_comment(cx: &mut TestAppContext) {
     init_test(cx, |_| {});
 
     let editor = cx.add_window(|window, cx| Editor::single_line(window, cx));
@@ -47125,8 +47125,9 @@ fn test_review_feedback_preserves_anchor_metadata_until_cleared(cx: &mut TestApp
         let snapshot = editor.buffer().read(cx).snapshot(cx);
         let start = snapshot.anchor_before(Point::new(0, 0));
         let end = snapshot.anchor_after(Point::new(1, 6));
-        editor.add_review_comment(
-            test_hunk_key_with_anchor("src/example.rs", start),
+        let key = test_hunk_key_with_anchor("src/example.rs", start);
+        let comment_id = editor.add_review_comment(
+            key.clone(),
             "Handle this edge case".to_string(),
             start..end,
             cx,
@@ -47134,13 +47135,15 @@ fn test_review_feedback_preserves_anchor_metadata_until_cleared(cx: &mut TestApp
 
         let feedback = editor.review_feedback(cx);
         assert_eq!(feedback.len(), 1);
-        assert_eq!(feedback[0].worktree_name, None);
-        assert_eq!(feedback[0].file_path, "src/example.rs");
-        assert_eq!(feedback[0].start_line, 1);
-        assert_eq!(feedback[0].end_line, 2);
-        assert_eq!(feedback[0].excerpt, "first\nsecond");
-        assert_eq!(feedback[0].comment, "Handle this edge case");
-        assert_eq!(feedback[0].status, ReviewCommentStatus::Draft);
+        let (feedback_id, feedback) = &feedback[0];
+        assert_eq!(*feedback_id, comment_id);
+        assert_eq!(feedback.worktree_name, None);
+        assert_eq!(feedback.file_path, "src/example.rs");
+        assert_eq!(feedback.start_line, 1);
+        assert_eq!(feedback.end_line, 2);
+        assert_eq!(feedback.excerpt, "first\nsecond");
+        assert_eq!(feedback.comment, "Handle this edge case");
+        assert_eq!(feedback.status, ReviewCommentStatus::Draft);
 
         let session = editor.review_session(cx);
         assert_eq!(session.source, ReviewSessionSource::LocalDiff);
@@ -47148,13 +47151,32 @@ fn test_review_feedback_preserves_anchor_metadata_until_cleared(cx: &mut TestApp
         assert_eq!(session.threads[0].file_path, "src/example.rs");
         assert_eq!(session.threads[0].comments[0].author, "You");
 
-        editor.mark_review_feedback_sent(cx);
-        assert!(editor.review_feedback(cx).is_empty());
-        assert_eq!(editor.total_review_comment_count(), 0);
+        let other_comment =
+            editor.add_review_comment(key.clone(), "A separate draft".into(), start..end, cx);
+        editor.begin_diff_review(&[comment_id], cx);
+        assert_eq!(editor.review_feedback(cx)[0].0, other_comment);
+        editor.finish_diff_review(
+            &[comment_id],
+            "Codex".into(),
+            Some(&HashMap::from_iter([(
+                comment_id,
+                "Handled the edge case.".into(),
+            )])),
+            window,
+            cx,
+        );
 
-        editor.clear_review_feedback(cx);
-        assert!(editor.review_feedback(cx).is_empty());
-        assert_eq!(editor.total_review_comment_count(), 0);
+        let comments = editor.comments_for_hunk(&key, &snapshot);
+        assert_eq!(comments[0].status, ReviewCommentStatus::Sent);
+        assert_eq!(
+            comments[0]
+                .agent_reply
+                .as_ref()
+                .map(|(agent, reply)| (agent.as_ref(), reply.as_str())),
+            Some(("Codex", "Handled the edge case."))
+        );
+        assert_eq!(comments[1].status, ReviewCommentStatus::Draft);
+        assert!(comments[1].agent_reply.is_none());
     });
     assert!(result.is_ok(), "editor window should remain available");
 }
@@ -47172,15 +47194,13 @@ fn test_review_feedback_marks_orphaned_comments_outdated(cx: &mut TestAppContext
     editor
         .update(cx, |editor, _window, cx| {
             let snapshot = editor.buffer().read(cx).snapshot(cx);
-            let anchor = snapshot.anchor_after(Point::new(1, 0));
-            let key = DiffHunkKey {
-                file_path: Arc::from(util::rel_path::RelPath::empty()),
-                hunk_start_anchor: anchor,
-            };
+            let start = snapshot.anchor_after(Point::new(1, 0));
+            let end = snapshot.anchor_before(Point::new(1, 6));
+            let key = test_hunk_key_with_anchor("src/example.rs", start);
             editor.add_review_comment(
                 key.clone(),
                 "Keep this review note".to_string(),
-                anchor..anchor,
+                start..end,
                 cx,
             );
             assert_eq!(editor.total_review_comment_count(), 1);
@@ -47216,6 +47236,51 @@ fn test_review_feedback_marks_orphaned_comments_outdated(cx: &mut TestAppContext
             assert_eq!(retained[0].1.len(), 1);
             assert_eq!(retained[0].1[0].comment, "Keep this review note");
             assert_eq!(retained[0].1[0].status, ReviewCommentStatus::Outdated);
+        })
+        .unwrap();
+}
+
+#[gpui::test]
+fn test_review_feedback_becomes_outdated_when_the_excerpt_changes(cx: &mut TestAppContext) {
+    init_test(cx, |_| {});
+
+    let editor = cx.add_window(|window, cx| {
+        let buffer = cx.new(|cx| Buffer::local("before\noriginal\nafter\n", cx));
+        let multi_buffer = cx.new(|cx| MultiBuffer::singleton(buffer, cx));
+        Editor::new(EditorMode::full(), multi_buffer, None, window, cx)
+    });
+
+    editor
+        .update(cx, |editor, window, cx| {
+            let snapshot = editor.buffer().read(cx).snapshot(cx);
+            let start = snapshot.anchor_after(Point::new(1, 0));
+            let end = snapshot.anchor_before(Point::new(1, 8));
+            let key = test_hunk_key_with_anchor("src/example.rs", start);
+            editor.add_review_comment(key.clone(), "Keep this comment".to_string(), start..end, cx);
+
+            editor.change_selections(SelectionEffects::no_scroll(), window, cx, |selections| {
+                selections.select_ranges([Point::new(0, 0)..Point::new(0, 0)]);
+            });
+            editor.insert("new line\n", window, cx);
+            editor.cleanup_orphaned_review_comments(cx);
+            let snapshot = editor.buffer().read(cx).snapshot(cx);
+            assert_eq!(
+                editor.comments_for_hunk(&key, &snapshot)[0].status,
+                ReviewCommentStatus::Draft,
+            );
+
+            editor.change_selections(SelectionEffects::no_scroll(), window, cx, |selections| {
+                selections.select_ranges([Point::new(2, 2)..Point::new(2, 3)]);
+            });
+            editor.insert("x", window, cx);
+            editor.cleanup_orphaned_review_comments(cx);
+            let snapshot = editor.buffer().read(cx).snapshot(cx);
+            assert!(start.is_valid(&snapshot));
+            assert!(end.is_valid(&snapshot));
+            let comments = editor.comments_for_hunk(&key, &snapshot);
+            assert_eq!(comments[0].comment, "Keep this comment");
+            assert_eq!(comments[0].status, ReviewCommentStatus::Outdated);
+            assert!(editor.review_feedback(cx).is_empty());
         })
         .unwrap();
 }
@@ -47851,71 +47916,47 @@ fn test_diff_review_drag_cancel(cx: &mut TestAppContext) {
 }
 
 #[gpui::test]
-fn test_calculate_overlay_height(cx: &mut TestAppContext) {
+fn test_same_line_review_comments_close_independently(cx: &mut TestAppContext) {
     init_test(cx, |_| {});
-
-    // This test verifies that calculate_overlay_height returns correct heights
-    // based on comment count and expanded state.
-    let editor = cx.add_window(|window, cx| Editor::single_line(window, cx));
-
-    _ = editor.update(cx, |editor, _window, cx| {
-        let snapshot = editor.buffer().read(cx).snapshot(cx);
-        let anchor = snapshot.anchor_before(Point::new(0, 0));
-        let key = DiffHunkKey {
-            file_path: Arc::from(util::rel_path::RelPath::empty()),
-            hunk_start_anchor: anchor,
-        };
-
-        // No comments: base height of 2
-        let height_no_comments = editor.calculate_overlay_height(&key, true, &snapshot);
-        assert_eq!(
-            height_no_comments, 2,
-            "Base height should be 2 with no comments"
-        );
-
-        // Add one comment
-        editor.add_review_comment(key.clone(), "Comment 1".to_string(), anchor..anchor, cx);
-
-        let snapshot = editor.buffer().read(cx).snapshot(cx);
-
-        // With comments expanded: base (2) + header (1) + 2 per comment
-        let height_expanded = editor.calculate_overlay_height(&key, true, &snapshot);
-        assert_eq!(
-            height_expanded,
-            2 + 1 + 2, // base + header + 1 comment * 2
-            "Height with 1 comment expanded"
-        );
-
-        // With comments collapsed: base (2) + header (1)
-        let height_collapsed = editor.calculate_overlay_height(&key, false, &snapshot);
-        assert_eq!(
-            height_collapsed,
-            2 + 1, // base + header only
-            "Height with comments collapsed"
-        );
-
-        // Add more comments
-        editor.add_review_comment(key.clone(), "Comment 2".to_string(), anchor..anchor, cx);
-        editor.add_review_comment(key.clone(), "Comment 3".to_string(), anchor..anchor, cx);
-
-        let snapshot = editor.buffer().read(cx).snapshot(cx);
-
-        // With 3 comments expanded
-        let height_3_expanded = editor.calculate_overlay_height(&key, true, &snapshot);
-        assert_eq!(
-            height_3_expanded,
-            2 + 1 + (3 * 2), // base + header + 3 comments * 2
-            "Height with 3 comments expanded"
-        );
-
-        // Collapsed height stays the same regardless of comment count
-        let height_3_collapsed = editor.calculate_overlay_height(&key, false, &snapshot);
-        assert_eq!(
-            height_3_collapsed,
-            2 + 1, // base + header only
-            "Height with 3 comments collapsed should be same as 1 comment collapsed"
-        );
+    let editor = cx.add_window(|window, cx| {
+        let buffer = cx.new(|cx| Buffer::local("changed line\n", cx));
+        let buffer = cx.new(|cx| MultiBuffer::singleton(buffer, cx));
+        Editor::new(EditorMode::full(), buffer, None, window, cx)
     });
+
+    editor
+        .update(cx, |editor, window, cx| {
+            let row = DisplayRow(0);
+            editor.show_diff_review_overlay(row..row, window, cx);
+            let first = editor.diff_review_overlays[0].block_id;
+            editor.show_diff_review_overlay(row..row, window, cx);
+            let second = editor.diff_review_overlays[1].block_id;
+            assert_ne!(first, second);
+
+            let prompt = editor.diff_review_prompt_editor().unwrap().clone();
+            prompt.update(cx, |prompt, cx| prompt.insert("First draft", window, cx));
+            editor.close_diff_review_overlay(first, window, cx);
+            assert_eq!(editor.diff_review_overlays.len(), 1);
+            assert_eq!(editor.diff_review_overlays[0].block_id, second);
+            assert_eq!(prompt.read(cx).text(cx), "First draft");
+
+            editor.submit_diff_review_comment(window, cx);
+            let first_comment = editor.diff_review_overlays[0].comment_id.unwrap();
+            editor.show_diff_review_overlay(row..row, window, cx);
+            let third = editor.diff_review_overlays[1].block_id;
+            let prompt = editor.diff_review_prompt_editor().unwrap().clone();
+            prompt.update(cx, |prompt, cx| prompt.insert("Second draft", window, cx));
+            editor.submit_diff_review_comment(window, cx);
+            let second_comment = editor.diff_review_overlays[1].comment_id.unwrap();
+            assert_ne!(first_comment, second_comment);
+
+            editor.close_diff_review_overlay(third, window, cx);
+            assert!(editor.diff_review_overlays[0].comments_expanded);
+            assert!(!editor.diff_review_overlays[1].comments_expanded);
+            assert_eq!(editor.total_review_comment_count(), 2);
+            assert_eq!(editor.review_session(cx).threads.len(), 2);
+        })
+        .unwrap();
 }
 
 #[gpui::test]
