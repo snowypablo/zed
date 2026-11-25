@@ -36,6 +36,10 @@ impl FeatureFlag for DiffReviewFeatureFlag {
     fn enabled_for_staff() -> bool {
         false
     }
+
+    fn enabled_for_all() -> bool {
+        option_env!("ZED_BUILD_DIFF_REVIEW") == Some("1")
+    }
 }
 register_feature_flag!(DiffReviewFeatureFlag);
 
